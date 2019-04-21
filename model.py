@@ -6,7 +6,7 @@ from utils import to_var
 class SentenceVAE(nn.Module):
 
     def __init__(self, vocab_size, embedding_size, rnn_type, hidden_size, word_dropout, embedding_dropout, latent_size,
-                sos_idx, eos_idx, pad_idx, unk_idx, max_sequence_length, num_layers=1, bidirectional=False):
+                sos_idx, eos_idx, pad_idx, unk_idx, max_sequence_length, num_layers=1, bidirectional=False, classify_label=3):
 
         super().__init__()
         self.tensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.Tensor
@@ -27,7 +27,6 @@ class SentenceVAE(nn.Module):
         self.embedding = nn.Embedding(vocab_size, embedding_size)
         self.word_dropout_rate = word_dropout
         self.embedding_dropout = nn.Dropout(p=embedding_dropout)
-
         if rnn_type == 'rnn':
             rnn = nn.RNN
         elif rnn_type == 'gru':
@@ -46,15 +45,12 @@ class SentenceVAE(nn.Module):
         self.hidden2logv = nn.Linear(hidden_size * self.hidden_factor, latent_size)
         self.latent2hidden = nn.Linear(latent_size, hidden_size * self.hidden_factor)
         self.outputs2vocab = nn.Linear(hidden_size * (2 if bidirectional else 1), vocab_size)
+        self.label_pred = nn.Sequential([nn.Linear(hidden_size * self.hidden_factor, classify_label), nn.LogSoftmax(dim=-1)])
 
-    def forward(self, input_sequence, length):
+    def setenceEmbed(self, input_sequence):
+        return self.embedding(input_sequence)
 
-        batch_size = input_sequence.size(0)
-        sorted_lengths, sorted_idx = torch.sort(length, descending=True)
-        input_sequence = input_sequence[sorted_idx]
-
-        # ENCODER
-        input_embedding = self.embedding(input_sequence)
+    def encoder(self, input_embedding, sorted_lengths, batch_size):
 
         packed_input = rnn_utils.pack_padded_sequence(input_embedding, sorted_lengths.data.tolist(), batch_first=True)
 
@@ -62,7 +58,7 @@ class SentenceVAE(nn.Module):
 
         if self.bidirectional or self.num_layers > 1:
             # flatten hidden state
-            hidden = hidden.view(batch_size, self.hidden_size*self.hidden_factor)
+            hidden = hidden.view(batch_size, self.hidden_size * self.hidden_factor)
         else:
             hidden = hidden.squeeze()
 
@@ -70,13 +66,9 @@ class SentenceVAE(nn.Module):
         mean = self.hidden2mean(hidden)
         logv = self.hidden2logv(hidden)
         std = torch.exp(0.5 * logv)
+        return mean, logv, std
 
-        z = to_var(torch.randn([batch_size, self.latent_size]))
-        z = z * std + mean
-
-        # DECODER
-        hidden = self.latent2hidden(z)
-
+    def decoder(self, input_sequence, input_embedding, sorted_lengths, sorted_idx, batch_size, hidden):
         if self.bidirectional or self.num_layers > 1:
             # unflatten hidden state
             hidden = hidden.view(self.hidden_factor, batch_size, self.hidden_size)
@@ -88,30 +80,61 @@ class SentenceVAE(nn.Module):
             # randomly replace decoder input with <unk>
             prob = torch.rand(input_sequence.size())
             if torch.cuda.is_available():
-                prob=prob.cuda()
+                prob = prob.cuda()
             prob[(input_sequence.data - self.sos_idx) * (input_sequence.data - self.pad_idx) == 0] = 1
             decoder_input_sequence = input_sequence.clone()
             decoder_input_sequence[prob < self.word_dropout_rate] = self.unk_idx
             input_embedding = self.embedding(decoder_input_sequence)
+
         input_embedding = self.embedding_dropout(input_embedding)
         packed_input = rnn_utils.pack_padded_sequence(input_embedding, sorted_lengths.data.tolist(), batch_first=True)
 
         # decoder forward pass
+        # rnn read one item one time
         outputs, _ = self.decoder_rnn(packed_input, hidden)
 
         # process outputs
         padded_outputs = rnn_utils.pad_packed_sequence(outputs, batch_first=True)[0]
         padded_outputs = padded_outputs.contiguous()
-        _,reversed_idx = torch.sort(sorted_idx)
+        _, reversed_idx = torch.sort(sorted_idx)
         padded_outputs = padded_outputs[reversed_idx]
-        b,s,_ = padded_outputs.size()
+        b, s, _ = padded_outputs.size()
 
         # project outputs to vocab
         logp = nn.functional.log_softmax(self.outputs2vocab(padded_outputs.view(-1, padded_outputs.size(2))), dim=-1)
-        logp = logp.view(b, s, self.embedding.num_embeddings)
+        return logp
 
+    def forward(self, input_sequence, length, classify=False):
+        batch_size = input_sequence.size(0)
+        #input_embedding, sorted_lengths, batch_size
+        sorted_lengths, sorted_idx = torch.sort(length, descending=True)
+        input_sequence = input_sequence[sorted_idx]
+        input_embedding = self.embedding(input_sequence)
 
-        return logp, mean, logv, z
+        mean, logv, std = self.encoder(input_embedding, sorted_lengths, batch_size)
+        #input_sequence, input_embedding, sorted_lengths, sorted_idx, batch_size, z
+
+        z = to_var(torch.randn([batch_size, self.latent_size]))
+        z = z * std + mean
+        hidden = self.latent2hidden(z)
+        logp = self.decoder(input_sequence, input_embedding, sorted_lengths, sorted_idx, batch_size, hidden)
+
+        if classify:
+            #mse
+            answer_predic = self.label_pred(hidden)
+            #inverse encoder
+            inv_sequence = torch.argmax(logp, dim=-1)
+            inv_input_embedding = self.embedding(inv_sequence)
+            inv_mean, inv_logv, inv_std = self.encoder(inv_input_embedding, sorted_lengths, batch_size)
+            inv_z = to_var(torch.randn([batch_size, self.latent_size]))
+            inv_z = inv_z * inv_std + inv_mean
+            #inv
+            inv_hidden = self.latent2hidden(inv_z)
+            inv_error = torch.sum(answer_predic - self.label_pred(inv_hidden))
+            return logp, mean, logv, z, answer_predic, inv_error
+
+        else:
+            return logp, mean, logv, z
 
 
     def inference(self, n=4, z=None):
@@ -194,3 +217,64 @@ class SentenceVAE(nn.Module):
         save_to[running_seqs] = running_latest
 
         return save_to
+
+class Intervention(nn.Module):
+    def __init__(self, question_class, inter_class, model:SentenceVAE):
+        super(Intervention, self).__init__()
+        self.question_class = question_class
+        self.inter_class = inter_class
+        self.erase_embedding = nn.Embedding(inter_class+1, 1, padding_idx=0)
+        self.add_embedding = nn.Embedding(inter_class + 1, 1, padding_idx=0)
+        self.model = model
+    def reconstruct_mean(self, source_sequence, source_sequence_len, edit_sequence, edit_sequence_len, interven_class):
+        batch_size = edit_sequence.shape[0]
+        # get encoder std
+        sorted_lengths, sorted_idx = torch.sort(source_sequence_len, descendin=True)
+        source_sequence = source_sequence[sorted_idx]
+        source_sequence_embed = self.model.embedding(source_sequence)
+        #input_embedding, sorted_lengths, batch_size
+        _, _, std = self.model.encoder(source_sequence_embed, sorted_lengths, batch_size)
+        z = to_var(torch.randn([batch_size, self.latent_size]))
+        z = z * std + self.add_embedding(interven_class)
+
+        sorted_lengths, sorted_idx = torch.sort(edit_sequence_len, descending=True)
+        edit_sequence = edit_sequence[sorted_idx]
+        edit_seq_embed = self.model.embedding(edit_sequence)
+        hidden = self.model.latent2hidden(z)
+        #input_sequence, input_embedding, sorted_lengths, sorted_idx, batch_size, hidden
+        logp = self.model.decoder(edit_sequence, edit_seq_embed, sorted_lengths, sorted_idx, batch_size, hidden)
+        # only calculate the BCELOSS
+        return logp
+
+
+    def reconstruct_erase_add(self, source_sequence, source_sequence_len, edit_sequence, edit_sequence_len, interven_class):
+        batch_size = edit_sequence.shape[0]
+        # get encoder std
+        sorted_lengths, sorted_idx = torch.sort(source_sequence_len, descendin=True)
+        source_sequence = source_sequence[sorted_idx]
+        source_sequence_embed = self.model.embedding(source_sequence)
+        # input_embedding, sorted_lengths, batch_size
+        mean, _, std = self.model.encoder(source_sequence_embed, sorted_lengths, batch_size)
+        z = to_var(torch.randn([batch_size, self.latent_size]))
+        z = z * std + mean
+        z = z * (1 - self.erase_embedding(interven_class)) + self.add_embedding(interven_class)
+
+        sorted_lengths, sorted_idx = torch.sort(edit_sequence_len, descending=True)
+        edit_sequence = edit_sequence[sorted_idx]
+        edit_seq_embed = self.model.embedding(edit_sequence)
+        hidden = self.model.latent2hidden(z)
+        # input_sequence, input_embedding, sorted_lengths, sorted_idx, batch_size, hidden
+        logp = self.model.decoder(edit_sequence, edit_seq_embed, sorted_lengths, sorted_idx, batch_size, hidden)
+        # only calculate the BCELOSS
+        return logp, hidden
+
+
+    def forward(self, source_sequence, source_sequence_len, edit_sequence, edit_sequence_len, interven_class, recons_type="erase"):
+        if recons_type == "erase":
+            logp, hidden = self.reconstruct_erase_add(source_sequence, source_sequence_len, edit_sequence, edit_sequence_len, interven_class)
+        else:
+            logp, hidden = self.reconstruct_mean(source_sequence, source_sequence_len, edit_sequence, edit_sequence_len, interven_class)
+
+        question_pred = self.model.label_pred(hidden)
+
+        return logp, question_pred
